@@ -24,14 +24,14 @@ This repository provides a Docker Compose setup to self-host [TeslaMate](https:/
 
 3. Configure any additional settings in `docker-compose.yml` if you need custom ports or volumes.
 
-4. Start the stack:
+4. Start the rootful Docker stack:
    ```bash
-   docker-compose up -d
+   sudo docker compose up -d
    ```
 
 5. Verify services are running:
    ```bash
-   docker-compose ps
+   sudo docker compose ps
    ```
 
 ## Configuration
@@ -46,9 +46,18 @@ Edit variables in your `.env` file.
 
 ## Logs & Management
 
-- View logs: `docker-compose logs -f`
-- Stop services: `docker-compose down`
-- Rebuild after changes: `docker-compose up -d --build`
+- View logs: `sudo docker compose logs -f`
+- Stop services: `sudo docker compose down`
+- Apply image changes: `sudo docker compose pull && sudo docker compose up -d`
+
+## Operational Runbooks
+
+See [TeslaMate upgrade and mileage backfill](docs/UPGRADE_AND_BACKFILL.md) for:
+
+- why this deployment moved from TeslaMate 2.1.1 to 4.0.1;
+- how to create and verify a PostgreSQL backup before upgrading;
+- how to upgrade the rootful Docker Compose deployment safely; and
+- how to diagnose and reconstruct mileage after an API outage without turning weeks of raw positions into a single drive.
 
 ## Backup & Data Retention
 
@@ -56,7 +65,7 @@ Edit variables in your `.env` file.
 - Grafana data is in `./data/grafana`
 - Mosquitto data is in `./data/mosquitto-data` and `./data/mosquitto-conf`
 
-Regularly back up the data in the `./data` directory.
+Regularly back up the data in the `./data` directory. Before upgrades or database maintenance, also create a logical PostgreSQL dump as described in the operational runbook.
 
 ## Troubleshooting
 
@@ -64,5 +73,5 @@ Regularly back up the data in the `./data` directory.
 - Check port conflicts on your host machine.
 - Review logs for errors:
   ```bash
-  docker-compose logs teslamate
+  sudo docker compose logs teslamate
   ```
