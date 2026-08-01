@@ -162,12 +162,14 @@ The incident-specific SQL should:
 3. assert the exact source drive IDs and position counts;
 4. calculate candidate segments in temporary tables;
 5. assert the expected candidate, valid-drive, and zero-distance counts;
-6. insert new drive rows and reassign every affected position exactly once;
+6. insert new drive rows with IDs increasing globally by `start_date`, then reassign every affected position exactly once;
 7. reproduce TeslaMate's `close_drive/2` aggregates, including dates, odometer distance, duration, ranges, temperatures, speed, power, elevation, position IDs, and geofences;
 8. assert raw-position counts, target mappings, mileage totals, chronology, and foreign-key integrity; and
 9. commit only if every assertion succeeds.
 
 Keep the transaction wrapped in `BEGIN`/`COMMIT`, use `psql` with `ON_ERROR_STOP`, and make every failed invariant raise an exception so PostgreSQL rolls back the whole repair.
+
+Drive IDs are ordering data in practice. The Grafana Drives dashboard orders its table by `drive_id DESC`, and other TeslaMate dashboards use adjacent IDs to infer preceding or following drives. Do not rely on unspecified `UPDATE` or `INSERT` row order when allocating IDs, and do not allocate separate chronological sequences per car. Assign the recovered range in one global `ORDER BY start_date,id` sequence, preserving any newer natural drives outside that range.
 
 ### 5. Prove the repair on the clone
 
@@ -178,9 +180,26 @@ Validate at least these invariants:
 - all reconstructed drives have start/end dates and positions;
 - all reconstructed distances are at least 0.01 km;
 - reconstructed drives do not overlap for the same car;
+- reconstructed IDs have no chronological inversions when ordered numerically;
 - no drive-to-position or position-to-drive foreign keys are broken;
 - the sum of `drives.distance` matches the sum of segment end-odometer minus start-odometer; and
 - no unintended incomplete drives remain.
+
+Check ID chronology explicitly:
+
+```sql
+SELECT count(*) AS chronological_inversions
+FROM (
+  SELECT id,
+         start_date,
+         lag(start_date) OVER (ORDER BY id) AS previous_start
+  FROM drives
+  WHERE id BETWEEN :first_reconstructed_id AND :last_reconstructed_id
+) ordered
+WHERE start_date < previous_start;
+```
+
+The result must be zero. Also compare the newest drive for each car using both `ORDER BY start_date DESC` and `ORDER BY id DESC`; they must identify the same drive.
 
 Review per-car drive counts, mileage, average duration, maximum duration, and days containing raw samples but no reconstructed mileage. Inspect aggregate results only; do not put coordinates, VINs, tokens, or credentials in logs or Git.
 
@@ -229,6 +248,25 @@ The address pass is normally network-rate-limited by reverse-geocoding calls, no
 
 After completion, rerun all database checks, verify the HTTP endpoints and containers, and take a verified post-repair dump.
 
+### Correcting non-chronological reconstructed IDs
+
+If an earlier reconstruction assigned valid drives non-chronological IDs, do not change timestamps or rebuild the drives. Remap only the known reconstructed ID range in an isolated clone, then apply the identical guarded transaction to production.
+
+The remap must:
+
+1. snapshot every affected drive payload excluding `id` and every affected position ID;
+2. map the reconstructed range to a global `row_number() OVER (ORDER BY start_date,id)` sequence;
+3. move drives and `positions.drive_id` references through collision-free temporary IDs;
+4. leave newer natural drive IDs and the `trips_id_seq` value unchanged;
+5. verify every drive payload is identical except for `id`;
+6. verify every affected position points to its intended new ID;
+7. verify mileage, row counts, addresses, endpoints, foreign keys, and outside-range drives are unchanged; and
+8. verify zero chronological inversions before commit.
+
+On a large positions table, the `ON DELETE SET NULL` foreign-key trigger can be slow if `positions.drive_id` has only a BRIN index. A transaction-scoped B-tree index on `positions(drive_id)` makes the remap's equality lookups efficient; drop that temporary index before commit so the production schema remains unchanged.
+
+Renumbering changes the meaning of old bookmarked drive-detail URLs because those URLs contain `drive_id`. Refresh Grafana after the remap and treat pre-remap drive-detail bookmarks as stale.
+
 ### 8. Clean up safely
 
 Only after the pre-repair and post-repair archives have been verified should the disposable clone be removed. Resolve the exact name and confirm that it has zero active connections before running `dropdb`. The clone remains reproducible from the verified pre-repair archive.
@@ -236,5 +274,7 @@ Only after the pre-repair and post-repair archives have been verified should the
 ## August 2026 recovery result
 
 The production recovery reconstructed 340 completed drives from 964,741 affected raw positions. It retained every raw position, left 2,914 zero-distance samples unassociated, produced no overlapping drives or broken references, and restored 4,208.434561 km of observed odometer mileage across both cars. TeslaMate's built-in worker subsequently completed address enrichment for all reconstructed drives.
+
+A follow-up validation found that the initial SQL had assigned some new IDs in unspecified update order. Although drive contents and mileage were correct, Grafana displayed an older drive first because it sorts the Drives table by ID. A clone-tested follow-up remapped 339 reconstructed drives into global chronological order, changing 338 IDs while preserving all drive fields and 959,387 position links. Post-remap validation found zero chronological inversions, broken references, missing addresses, or mileage changes.
 
 Verified pre-repair and post-repair dumps are stored locally under `tmp/` and are intentionally excluded from Git.
