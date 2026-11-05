@@ -128,13 +128,15 @@ Restore Grafana with both applications still stopped:
 sha256sum --check tmp/grafana-cutover.tar.sha256
 kubectl --context "$task_context" apply -f deploy/kubernetes/restore-files.yaml
 kubectl --context "$task_context" -n teslamate wait --for=condition=Ready pod/file-restore --timeout=15m
-kubectl --context "$task_context" -n teslamate exec -i file-restore -- \
-  tar -xf - --no-same-owner -C /restore/grafana < tmp/grafana-cutover.tar
+set -o pipefail
+python3 deploy/strip-tar-root.py tmp/grafana-cutover.tar \
+  | kubectl --context "$task_context" -n teslamate exec -i file-restore -- \
+      tar -xf - --no-same-owner -C /restore/grafana
 # If needed, extract the import archive into /restore/import similarly.
 kubectl --context "$task_context" -n teslamate delete pod/file-restore --wait
 ```
 
-The temporary Pod runs without root or secrets. Remove it before starting the PVC consumers. Never copy a running Grafana SQLite database.
+The temporary Pod runs without root or secrets. The helper omits only the archive's root-directory header, preserving all file contents and the original archive. This avoids changing metadata on the root-owned CSI mountpoint while extracting as Grafana's UID. Remove the Pod before starting the PVC consumers. Never copy a running Grafana SQLite database.
 
 ## 6. Activate and verify
 

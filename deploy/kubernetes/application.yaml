@@ -549,14 +549,13 @@ spec:
             - |
               export DATABASE_USER="$(cat /mnt/secrets-store/database-user)"
               export DATABASE_PASS="$(cat /mnt/secrets-store/database-password)"
+              export GF_SECURITY_ADMIN_PASSWORD="$(cat /mnt/secrets-store/grafana-admin-password)"
               exec /run.sh
           env:
             - name: DATABASE_NAME
               value: teslamate
             - name: DATABASE_HOST
               value: database
-            - name: GF_SECURITY_ADMIN_PASSWORD__FILE
-              value: /mnt/secrets-store/grafana-admin-password
             - name: GF_SERVER_ROOT_URL
               value: https://teslamate.benzhang.dev/grafana/
             - name: GF_SERVER_SERVE_FROM_SUB_PATH
