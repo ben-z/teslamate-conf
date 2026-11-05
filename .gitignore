@@ -4,9 +4,9 @@
 /.env.*
 !/.env.example
 /import/*
-*.dump
-*.bck
-*.backup
-__pycache__/
-.DS_Store
-._*
+**/*.dump
+**/*.bck
+**/*.backup
+**/__pycache__/
+**/.DS_Store
+**/._*
