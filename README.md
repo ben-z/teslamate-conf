@@ -1,77 +1,62 @@
-# TeslaMate Configuration
+# TeslaMate
 
-This repository provides a Docker Compose setup to self-host [TeslaMate](https://github.com/teslamate-org/teslamate), an open-source data logger and visualization tool for Tesla vehicles. Use this configuration to quickly deploy TeslaMate, PostgreSQL, Mosquitto, Grafana, and Prometheus.
+Configuration for this deployment: TeslaMate 4.0.1, its matching Grafana dashboards, PostgreSQL 17.5, and Mosquitto 2.0.21. Images are pinned by digest. Prometheus belongs to the host's separate observability stack.
 
-## Prerequisites
+## Cloud deployment
 
-- Docker (>= 20.10)
-- Docker Compose (>= 1.29)
-- A Tesla vehicle account for data access
+The application follows the [Unicorns satellite deployment contract](https://github.com/unicorns/infra/blob/main/docs/satellite-app-deployment.md) on `unicorns-aks`, namespace `teslamate`.
 
-## Getting Started
+| Service | Private address |
+| --- | --- |
+| TeslaMate | https://teslamate.benzhang.dev/ |
+| Grafana | https://teslamate.benzhang.dev/grafana/ |
+| Release identifier | https://teslamate.benzhang.dev/api/version |
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/ben-z/teslamate-conf.git
-   cd teslamate-conf
-   ```
+These are the intended cloud addresses; follow the [migration runbook](docs/CLOUD_MIGRATION.md) to register, restore, and activate them. Tailscale supplies private access and the platform handles TLS. Database and MQTT Services stay inside the cluster; MQTT requires authentication.
 
-2. Copy the example environment file and customize it:
-   ```bash
-   cp .env.example .env
-   # Edit .env to set your credentials and preferred settings
-   ```
+Application configuration lives in `deploy/`. Actions checks changes, publishes native AMD64/ARM64 gateway and backup images, and deploys with GitHub OIDC and namespace-scoped RBAC. Runtime credentials come from a dedicated Key Vault through AKS workload identity.
 
-3. Configure any additional settings in `docker-compose.yml` if you need custom ports or volumes.
+Bootstrap initializes `TESLAMATE_MODE=prepare`: PostgreSQL, MQTT, and the gateway start, while TeslaMate, Grafana, and scheduled backups stay off. Enable `active` only after stopping the old logger and verifying the restored database.
 
-4. Start the rootful Docker stack:
-   ```bash
-   sudo docker compose up -d
-   ```
+## Existing Compose deployment
 
-5. Verify services are running:
-   ```bash
-   sudo docker compose ps
-   ```
+Use Docker Engine and Compose v2. Run these commands from the repository root. The existing host uses rootful Docker:
 
-## Configuration
+```sh
+sudo docker compose config --quiet
+sudo docker compose up -d
+sudo docker compose ps
+sudo docker compose logs --since=10m teslamate
+```
 
-Edit variables in your `.env` file.
+For a new installation, copy `.env.example` to `.env` and replace every placeholder; generate an encryption key with `openssl rand -hex 32`. For this existing installation, preserve the current `.env`, especially `TESLAMATE_ENCRYPTION_KEY`, which decrypts the stored Tesla tokens.
 
-## Accessing the Services
+TeslaMate is at http://127.0.0.1:4000/ and Grafana is at http://localhost:3001/. Compose publishes Grafana on all host interfaces. Change a new Grafana installation's initial `admin`/`admin` password after signing in. See [upstream installation instructions](https://docs.teslamate.org/docs/installation/docker/) for Tesla authentication.
 
-- **TeslaMate UI**: http://localhost:4000
-- **Grafana**: http://localhost:3001 (default: `admin`/`admin`)
-- **Prometheus**: http://localhost:9090
+Compose persists PostgreSQL in `data/teslamate-db`, Grafana in `data/grafana`, MQTT files in `data/mosquitto-*`, and imports in `import/`. These paths and `.env` are ignored by Git. Never run the local and cloud loggers for the same account together.
 
-## Logs & Management
+## Backups and maintenance
 
-- View logs: `sudo docker compose logs -f`
-- Stop services: `sudo docker compose down`
-- Apply image changes: `sudo docker compose pull && sudo docker compose up -d`
+Create a logical backup with mode 600, archive verification, and a SHA-256 checksum:
 
-## Operational Runbooks
+```sh
+scripts/backup.sh compose "tmp/teslamate-$(date -u +%Y%m%dT%H%M%SZ).dump"
+# On an operator host:
+scripts/backup.sh kubernetes YOUR_CONTEXT "tmp/teslamate-$(date -u +%Y%m%dT%H%M%SZ).dump"
+```
 
-See the incident-specific [2026-08-01 TeslaMate 4.0.1 upgrade and mileage backfill runbook](docs/upgrades/2026-08-01-teslamate-4.0.1-mileage-backfill.md) for:
+Copy verified archives to an independent location. Also preserve the encryption key and Grafana files. Copying a running PostgreSQL data directory is not a logical backup. Cloud PostgreSQL backups run daily into a private Blob container with 30-day retention; the migration runbook explains coverage and recovery.
 
-- why this deployment moved from TeslaMate 2.1.1 to 4.0.1;
-- how to create and verify a PostgreSQL backup before upgrading;
-- how to upgrade the rootful Docker Compose deployment safely; and
-- how to diagnose and reconstruct mileage after an API outage without turning weeks of raw positions into a single drive.
+The [2026-08-01 upgrade and mileage backfill runbook](docs/upgrades/2026-08-01-teslamate-4.0.1-mileage-backfill.md) records the earlier upgrade and recovery. Infrastructure migration keeps those application versions unchanged.
 
-## Backup & Data Retention
+## Checks
 
-- Database data is persisted in `./data/teslamate-db`
-- Grafana data is in `./data/grafana`
-- Mosquitto data is in `./data/mosquitto-data` and `./data/mosquitto-conf`
+```sh
+python3 -m pip install -r requirements-dev.txt
+scripts/check.sh
+# With access to the Docker daemon; uses isolated temporary containers:
+scripts/smoke-gateway.sh
+scripts/smoke-services.sh
+```
 
-Regularly back up the data in the `./data` directory. Before upgrades or database maintenance, also create a logical PostgreSQL dump as described in the operational runbook.
-
-## Troubleshooting
-
-- Ensure your Tesla credentials are correct and 2FA is disabled or handled appropriately.
-- Check port conflicts on your host machine.
-- Review logs for errors:
-  ```bash
-  sudo docker compose logs teslamate
-  ```
+Pull requests run the checks and build both custom containers. Production rollout verifies every workload image digest, private DNS, trusted HTTPS, the source commit endpoint, TeslaMate, and Grafana health. Operator access can be checked independently with the workflow's `verify_access_only` input.

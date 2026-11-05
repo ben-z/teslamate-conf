@@ -45,6 +45,8 @@ jobs:
         run: ./scripts/smoke-gateway.sh
       - name: Build backup container
         run: docker build --build-arg SOURCE_SHA="$GITHUB_SHA" -t teslamate-backup:check deploy/backup
+      - name: Verify broker authentication and Grafana subpath
+        run: ./scripts/smoke-services.sh
 
   verify-access:
     if: github.event_name == 'workflow_dispatch' && inputs.verify_access_only && github.ref == 'refs/heads/main'
