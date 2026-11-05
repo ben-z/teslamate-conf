@@ -1,6 +1,6 @@
 # TeslaMate
 
-Configuration for this deployment: TeslaMate 4.0.1, its matching Grafana dashboards, PostgreSQL 17.5, and Mosquitto 2.0.21. Images are pinned by digest. Prometheus belongs to the host's separate observability stack.
+Configuration for this deployment: TeslaMate 4.4.0, its matching Grafana dashboards (Grafana 13.2.4), PostgreSQL 17.5, and Mosquitto 2.0.21. Images are pinned by digest. Prometheus belongs to the host's separate observability stack.
 
 ## Cloud deployment
 
@@ -47,7 +47,7 @@ scripts/backup.sh kubernetes YOUR_CONTEXT "tmp/teslamate-$(date -u +%Y%m%dT%H%M%
 
 Copy verified archives to an independent location. Also preserve the encryption key and Grafana files. Copying a running PostgreSQL data directory is not a logical backup. Cloud PostgreSQL backups run daily into a private Blob container with 30-day retention; the migration runbook explains coverage and recovery.
 
-The [2026-08-01 upgrade and mileage backfill runbook](docs/upgrades/2026-08-01-teslamate-4.0.1-mileage-backfill.md) records the earlier upgrade and recovery. Infrastructure migration keeps those application versions unchanged.
+The [2026-11-05 TeslaMate 4.4.0 upgrade runbook](docs/upgrades/2026-11-05-teslamate-4.4.0.md) covers the current upgrade, charging-energy migration, validation, and rollback. The [2026-08-01 upgrade and mileage backfill runbook](docs/upgrades/2026-08-01-teslamate-4.0.1-mileage-backfill.md) records the earlier upgrade and history recovery.
 
 ## Checks
 

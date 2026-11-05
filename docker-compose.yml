@@ -1,6 +1,6 @@
 services:
   teslamate:
-    image: teslamate/teslamate:4.0.1@sha256:e77ec65007aafb40d736ed2c89675112fe8d960886ea9d7de3255f2b5360269f
+    image: teslamate/teslamate:4.4.0@sha256:c85b3d447502683ed7bf12fb478e0dae9a985fe975ac22cccb64faeb4c4a5d31
     restart: always
     environment:
       - ENCRYPTION_KEY=${TESLAMATE_ENCRYPTION_KEY:?}
@@ -38,7 +38,7 @@ services:
       start_period: 30s
 
   grafana:
-    image: teslamate/grafana:4.0.1@sha256:f2afcd9bdc849e65ef53c765be8590a0f0f8416709f501aa179760ea97035cf8
+    image: teslamate/grafana:4.4.0@sha256:2dd1fae85cd891e1d851350d13b547abf000efd602c8d0e5734eda6d43e22e01
     restart: always
     environment:
       - DATABASE_USER=${POSTGRES_USER:?}
