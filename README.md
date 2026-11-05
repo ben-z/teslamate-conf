@@ -52,7 +52,7 @@ Edit variables in your `.env` file.
 
 ## Operational Runbooks
 
-See [TeslaMate upgrade and mileage backfill](docs/UPGRADE_AND_BACKFILL.md) for:
+See the incident-specific [2026-08-01 TeslaMate 4.0.1 upgrade and mileage backfill runbook](docs/upgrades/2026-08-01-teslamate-4.0.1-mileage-backfill.md) for:
 
 - why this deployment moved from TeslaMate 2.1.1 to 4.0.1;
 - how to create and verify a PostgreSQL backup before upgrading;

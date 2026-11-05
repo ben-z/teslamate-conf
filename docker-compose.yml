@@ -15,6 +15,11 @@ services:
       - ./import:/opt/app/import
     cap_drop:
       - all
+    depends_on:
+      database:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
 
   database:
     image: postgres:17.5-bookworm@sha256:864831322bf2520e7d03d899b01b542de6de9ece6fe29c89f19dc5e1d5568ccf
@@ -25,6 +30,12 @@ services:
       - POSTGRES_DB=teslamate
     volumes:
       - ./data/teslamate-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   grafana:
     image: teslamate/grafana:4.0.1@sha256:f2afcd9bdc849e65ef53c765be8590a0f0f8416709f501aa179760ea97035cf8
@@ -38,13 +49,14 @@ services:
       - "3001:3000"
     volumes:
       - ./data/grafana:/var/lib/grafana
+    depends_on:
+      database:
+        condition: service_healthy
 
   mosquitto:
     image: eclipse-mosquitto:2.0.21@sha256:94f5a3d7deafa59fa3440d227ddad558f59d293c612138de841eec61bfa4d353
     restart: always
     command: mosquitto -c /mosquitto-no-auth.conf
-    # ports:
-    #   - "127.0.0.1:1883:1883"
     volumes:
       - ./data/mosquitto-conf:/mosquitto/config
       - ./data/mosquitto-data:/mosquitto/data
