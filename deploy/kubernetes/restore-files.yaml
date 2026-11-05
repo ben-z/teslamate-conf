@@ -1,0 +1,52 @@
+# Operator-only, temporary Pod. Apply while cloud Grafana and TeslaMate are stopped.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: file-restore
+  namespace: teslamate
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  activeDeadlineSeconds: 7200
+  nodeSelector:
+    unicorns.dev/workload: applications
+  tolerations:
+    - key: kubernetes.azure.com/scalesetpriority
+      operator: Equal
+      value: spot
+      effect: NoSchedule
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 472
+    runAsGroup: 472
+    fsGroup: 472
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: restore
+      image: postgres:17.5-bookworm@sha256:864831322bf2520e7d03d899b01b542de6de9ece6fe29c89f19dc5e1d5568ccf
+      command: [sleep, '7200']
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+      volumeMounts:
+        - name: grafana
+          mountPath: /restore/grafana
+        - name: import
+          mountPath: /restore/import
+  volumes:
+    - name: grafana
+      persistentVolumeClaim:
+        claimName: grafana
+    - name: import
+      persistentVolumeClaim:
+        claimName: import

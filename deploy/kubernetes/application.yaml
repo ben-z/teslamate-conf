@@ -1,0 +1,836 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: teslamate
+  namespace: teslamate
+  annotations:
+    azure.workload.identity/client-id: __TESLAMATE_SECRET_IDENTITY_CLIENT_ID__
+automountServiceAccountToken: false
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: teslamate
+  namespace: teslamate
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    useVMManagedIdentity: "false"
+    clientID: __TESLAMATE_SECRET_IDENTITY_CLIENT_ID__
+    keyvaultName: __TESLAMATE_KEY_VAULT_NAME__
+    tenantId: __AZURE_TENANT_ID__
+    objects: |
+      array:
+        - |
+          objectName: teslamate-encryption-key
+          objectType: secret
+          objectAlias: encryption-key
+        - |
+          objectName: teslamate-database-user
+          objectType: secret
+          objectAlias: database-user
+        - |
+          objectName: teslamate-database-password
+          objectType: secret
+          objectAlias: database-password
+        - |
+          objectName: teslamate-grafana-admin-password
+          objectType: secret
+          objectAlias: grafana-admin-password
+        - |
+          objectName: teslamate-mqtt-password
+          objectType: secret
+          objectAlias: mqtt-password
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mosquitto
+  namespace: teslamate
+data:
+  mosquitto.conf: |
+    listener 1883
+    allow_anonymous false
+    password_file /tmp/mosquitto-password
+    persistence true
+    persistence_location /mosquitto/data/
+    log_dest stdout
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana
+  namespace: teslamate
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: managed-csi
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mosquitto
+  namespace: teslamate
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: managed-csi
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: import
+  namespace: teslamate
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: managed-csi
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+  namespace: teslamate
+spec:
+  clusterIP: None
+  selector:
+    app: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mosquitto
+  namespace: teslamate
+spec:
+  selector:
+    app: mosquitto
+  ports:
+    - name: mqtt
+      port: 1883
+      targetPort: mqtt
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teslamate
+  namespace: teslamate
+spec:
+  selector:
+    app: teslamate
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: teslamate
+spec:
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: teslamate
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database
+  namespace: teslamate
+spec:
+  serviceName: database
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database
+  template:
+    metadata:
+      labels:
+        app: database
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: teslamate
+      nodeSelector:
+        unicorns.dev/workload: applications
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.azure.com/scalesetpriority
+                    operator: In
+                    values: [spot]
+      tolerations:
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: database
+          image: postgres:17.5-bookworm@sha256:864831322bf2520e7d03d899b01b542de6de9ece6fe29c89f19dc5e1d5568ccf
+          command: [sh, -ec]
+          args:
+            - |
+              export POSTGRES_USER="$(cat /mnt/secrets-store/database-user)"
+              exec docker-entrypoint.sh postgres
+          env:
+            - name: POSTGRES_PASSWORD_FILE
+              value: /mnt/secrets-store/database-password
+            - name: POSTGRES_DB
+              value: teslamate
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          startupProbe:
+            exec:
+              command: [sh, -ec, 'pg_isready -U "$(cat /mnt/secrets-store/database-user)" -d teslamate']
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            exec:
+              command: [sh, -ec, 'pg_isready -U "$(cat /mnt/secrets-store/database-user)" -d teslamate']
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            periodSeconds: 30
+            failureThreshold: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: secrets
+              mountPath: /mnt/secrets-store
+              readOnly: true
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: teslamate
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: managed-csi
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mosquitto
+  namespace: teslamate
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mosquitto
+  template:
+    metadata:
+      labels:
+        app: mosquitto
+        azure.workload.identity/use: "true"
+      annotations:
+        teslamate.dev/revision: __SOURCE_SHA__
+    spec:
+      serviceAccountName: teslamate
+      nodeSelector:
+        unicorns.dev/workload: applications
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.azure.com/scalesetpriority
+                    operator: In
+                    values: [spot]
+      tolerations:
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1883
+        runAsGroup: 1883
+        fsGroup: 1883
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mosquitto
+          image: eclipse-mosquitto:2.0.21@sha256:94f5a3d7deafa59fa3440d227ddad558f59d293c612138de841eec61bfa4d353
+          command: [sh, -ec]
+          args:
+            - |
+              umask 077
+              printf 'teslamate:%s\n' "$(cat /mnt/secrets-store/mqtt-password)" > /tmp/mosquitto-password
+              mosquitto_passwd -U /tmp/mosquitto-password
+              exec mosquitto -c /mosquitto/config/mosquitto.conf
+          ports:
+            - name: mqtt
+              containerPort: 1883
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          readinessProbe:
+            tcpSocket:
+              port: mqtt
+          livenessProbe:
+            tcpSocket:
+              port: mqtt
+            periodSeconds: 30
+          volumeMounts:
+            - name: config
+              mountPath: /mosquitto/config
+              readOnly: true
+            - name: data
+              mountPath: /mosquitto/data
+            - name: tmp
+              mountPath: /tmp
+            - name: secrets
+              mountPath: /mnt/secrets-store
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: mosquitto
+        - name: data
+          persistentVolumeClaim:
+            claimName: mosquitto
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: teslamate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teslamate
+  namespace: teslamate
+spec:
+  replicas: __LOGGER_REPLICAS__
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: teslamate
+  template:
+    metadata:
+      annotations:
+        teslamate.dev/revision: __SOURCE_SHA__
+      labels:
+        app: teslamate
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: teslamate
+      nodeSelector:
+        unicorns.dev/workload: applications
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.azure.com/scalesetpriority
+                    operator: In
+                    values: [spot]
+      tolerations:
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: teslamate
+          image: teslamate/teslamate:4.0.1@sha256:e77ec65007aafb40d736ed2c89675112fe8d960886ea9d7de3255f2b5360269f
+          command: [tini, --, /bin/dash, -ec]
+          args:
+            - |
+              export ENCRYPTION_KEY="$(cat /mnt/secrets-store/encryption-key)"
+              export DATABASE_USER="$(cat /mnt/secrets-store/database-user)"
+              export DATABASE_PASS="$(cat /mnt/secrets-store/database-password)"
+              export MQTT_PASSWORD="$(cat /mnt/secrets-store/mqtt-password)"
+              exec /entrypoint.sh bin/teslamate start
+          env:
+            - name: DATABASE_NAME
+              value: teslamate
+            - name: DATABASE_HOST
+              value: database
+            - name: MQTT_HOST
+              value: mosquitto
+            - name: MQTT_USERNAME
+              value: teslamate
+            - name: VIRTUAL_HOST
+              value: teslamate.benzhang.dev
+            - name: CHECK_ORIGIN
+              value: "true"
+            - name: TZ
+              value: America/Los_Angeles
+          ports:
+            - name: http
+              containerPort: 4000
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 30
+            failureThreshold: 5
+          volumeMounts:
+            - name: import
+              mountPath: /opt/app/import
+            - name: secrets
+              mountPath: /mnt/secrets-store
+              readOnly: true
+      volumes:
+        - name: import
+          persistentVolumeClaim:
+            claimName: import
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: teslamate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: teslamate
+spec:
+  replicas: __LOGGER_REPLICAS__
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      annotations:
+        teslamate.dev/revision: __SOURCE_SHA__
+      labels:
+        app: grafana
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: teslamate
+      nodeSelector:
+        unicorns.dev/workload: applications
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.azure.com/scalesetpriority
+                    operator: In
+                    values: [spot]
+      tolerations:
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: grafana
+          image: teslamate/grafana:4.0.1@sha256:f2afcd9bdc849e65ef53c765be8590a0f0f8416709f501aa179760ea97035cf8
+          command: [sh, -ec]
+          args:
+            - |
+              export DATABASE_USER="$(cat /mnt/secrets-store/database-user)"
+              export DATABASE_PASS="$(cat /mnt/secrets-store/database-password)"
+              exec /run.sh
+          env:
+            - name: DATABASE_NAME
+              value: teslamate
+            - name: DATABASE_HOST
+              value: database
+            - name: GF_SECURITY_ADMIN_PASSWORD__FILE
+              value: /mnt/secrets-store/grafana-admin-password
+            - name: GF_SERVER_ROOT_URL
+              value: https://teslamate.benzhang.dev/grafana/
+            - name: GF_SERVER_SERVE_FROM_SUB_PATH
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 3000
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /grafana/api/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /grafana/api/health
+              port: http
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/grafana
+            - name: secrets
+              mountPath: /mnt/secrets-store
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: grafana
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: teslamate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: teslamate
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        unicorns.dev/workload: applications
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.azure.com/scalesetpriority
+                    operator: In
+                    values: [spot]
+      tolerations:
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: __GATEWAY_IMAGE__
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: database-backup
+  namespace: teslamate
+spec:
+  schedule: "0 11 * * *"
+  timeZone: Etc/UTC
+  suspend: __BACKUP_SUSPEND__
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app: database-backup
+            azure.workload.identity/use: "true"
+        spec:
+          serviceAccountName: teslamate
+          restartPolicy: Never
+          nodeSelector:
+            unicorns.dev/workload: applications
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  preference:
+                    matchExpressions:
+                      - key: kubernetes.azure.com/scalesetpriority
+                        operator: In
+                        values: [spot]
+          tolerations:
+            - key: kubernetes.azure.com/scalesetpriority
+              operator: Equal
+              value: spot
+              effect: NoSchedule
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              image: __BACKUP_IMAGE__
+              env:
+                - name: PGHOST
+                  value: database
+                - name: PGDATABASE
+                  value: teslamate
+                - name: BACKUP_ACCOUNT
+                  value: __TESLAMATE_BACKUP_ACCOUNT__
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                - name: secrets
+                  mountPath: /mnt/secrets-store
+                  readOnly: true
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 2Gi
+            - name: secrets
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: teslamate
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: database
+  namespace: teslamate
+spec:
+  podSelector:
+    matchLabels:
+      app: database
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [teslamate, grafana, database-backup]
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mosquitto
+  namespace: teslamate
+spec:
+  podSelector:
+    matchLabels:
+      app: mosquitto
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: teslamate
+      ports:
+        - protocol: TCP
+          port: 1883
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: teslamate-private
+  namespace: teslamate
+spec:
+  ingressClassName: tailnet
+  rules:
+    - host: teslamate.benzhang.dev
+      http:
+        paths:
+          - path: /grafana
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 80

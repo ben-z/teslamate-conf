@@ -1,0 +1,243 @@
+name: Checks and Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      verify_access_only:
+        description: Verify production Azure OIDC and namespace permissions without building or deploying
+        type: boolean
+        default: false
+      rollback_gateway_image:
+        description: Previously deployed gateway image digest
+        type: string
+      rollback_backup_image:
+        description: Previously deployed backup image digest
+        type: string
+      rollback_source_sha:
+        description: Full source SHA of the rollback images
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: teslamate-${{ github.event_name == 'pull_request' && github.ref || 'production' }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    if: github.event_name != 'workflow_dispatch' || !inputs.verify_access_only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install -r requirements-dev.txt
+      - run: ./scripts/check.sh
+      - name: Build and exercise gateway
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: ./scripts/smoke-gateway.sh
+      - name: Build backup container
+        run: docker build --build-arg SOURCE_SHA="$GITHUB_SHA" -t teslamate-backup:check deploy/backup
+      - name: Verify broker authentication and Grafana subpath
+        run: ./scripts/smoke-services.sh
+
+  verify-access:
+    if: github.event_name == 'workflow_dispatch' && inputs.verify_access_only && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+        with:
+          version: v1.35.7
+      - uses: azure/use-kubelogin@76597ae0fcbaace21b05e13a2cbf8daee2c6e820 # v1.2
+        with:
+          kubelogin-version: v0.2.19
+      - uses: azure/aks-set-context@c7eb093e5a5d47caa333f64974d5fd1cd4bf069d # v4.0.3
+        with:
+          resource-group: ${{ vars.AZURE_RESOURCE_GROUP }}
+          cluster-name: ${{ vars.AZURE_AKS_CLUSTER_NAME }}
+          admin: false
+          use-kubelogin: true
+      - run: ./deploy/verify-access.sh
+
+  prepare:
+    needs: checks
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+      rollback: ${{ steps.release.outputs.rollback }}
+      gateway: ${{ steps.release.outputs.gateway }}
+      backup: ${{ steps.release.outputs.backup }}
+    steps:
+      - id: release
+        env:
+          ROLLBACK_GATEWAY: ${{ inputs.rollback_gateway_image }}
+          ROLLBACK_BACKUP: ${{ inputs.rollback_backup_image }}
+          ROLLBACK_SHA: ${{ inputs.rollback_source_sha }}
+        run: |
+          source_sha="$GITHUB_SHA"
+          rollback=false
+          if [[ -n "$ROLLBACK_GATEWAY$ROLLBACK_BACKUP$ROLLBACK_SHA" ]]; then
+            if [[ ! "$ROLLBACK_GATEWAY" =~ ^ghcr\.io/ben-z/teslamate-gateway@sha256:[0-9a-f]{64}$ ||
+                  ! "$ROLLBACK_BACKUP" =~ ^ghcr\.io/ben-z/teslamate-backup@sha256:[0-9a-f]{64}$ ||
+                  ! "$ROLLBACK_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo 'Rollback requires both immutable image digests and their full source SHA.' >&2
+              exit 1
+            fi
+            source_sha="$ROLLBACK_SHA"
+            rollback=true
+          fi
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "rollback=$rollback" >> "$GITHUB_OUTPUT"
+          echo "gateway=$ROLLBACK_GATEWAY" >> "$GITHUB_OUTPUT"
+          echo "backup=$ROLLBACK_BACKUP" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.rollback == 'false'
+    strategy:
+      matrix:
+        image: [gateway, backup]
+        architecture: [amd64, arm64]
+        include:
+          - architecture: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    # Use a separate architecture axis so each image is built natively for ARM Spot nodes.
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: docker/login-action@40891eba8c2bcd1309b07ba8b11232f313e86779 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.11.1
+      - uses: docker/build-push-action@91df6b874e498451163feb47610c87c4a218c1ee # v6.18.0
+        with:
+          build-args: SOURCE_SHA=${{ needs.prepare.outputs.sha }}
+          context: deploy/${{ matrix.image }}
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ghcr.io/ben-z/teslamate-${{ matrix.image }}:sha-${{ needs.prepare.outputs.sha }}-${{ matrix.architecture }}
+
+  publish:
+    needs: [prepare, build]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' &&
+      (needs.prepare.outputs.rollback == 'true' || needs.build.result == 'success')
+    runs-on: ubuntu-latest
+    outputs:
+      gateway: ${{ steps.images.outputs.gateway }}
+      backup: ${{ steps.images.outputs.backup }}
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/login-action@40891eba8c2bcd1309b07ba8b11232f313e86779 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.11.1
+      - id: images
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          ROLLBACK_GATEWAY: ${{ needs.prepare.outputs.gateway }}
+          ROLLBACK_BACKUP: ${{ needs.prepare.outputs.backup }}
+        run: |
+          for image in gateway backup; do
+            repository="ghcr.io/ben-z/teslamate-$image"
+            if [[ "$image" == gateway ]]; then rollback="$ROLLBACK_GATEWAY"; else rollback="$ROLLBACK_BACKUP"; fi
+            if [[ -n "$rollback" ]]; then
+              tag="$rollback"
+            else
+              tag="$repository:sha-$SOURCE_SHA"
+              docker buildx imagetools create --tag "$tag" "$tag-amd64" "$tag-arm64"
+            fi
+            manifest="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}')"
+            digest="$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' <<<"$manifest")"
+            platforms="$(jq -r '[.manifests[].platform | select(.os == "linux" and (.architecture == "amd64" or .architecture == "arm64")) | .architecture] | unique | sort | join(",")' <<<"$manifest")"
+            [[ "$platforms" == amd64,arm64 ]] || { echo "Missing AMD64 or ARM64 image" >&2; exit 1; }
+            for child in $(jq -r '.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .digest' <<<"$manifest"); do
+              config="$(docker buildx imagetools inspect "$repository@$child" --format '{{json .Image}}')"
+              jq -e --arg sha "$SOURCE_SHA" '.config.Labels["org.opencontainers.image.revision"] == $sha' <<<"$config" >/dev/null
+            done
+            echo "$image=$repository@$digest" >> "$GITHUB_OUTPUT"
+          done
+
+  deploy:
+    needs: [prepare, publish]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install -r requirements-dev.txt
+      - uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ vars.TAILSCALE_CLIENT_ID }}
+          audience: ${{ vars.TAILSCALE_AUDIENCE }}
+          tags: ${{ vars.TAILSCALE_CI_TAG }}
+          version: 1.102.4
+          args: --accept-dns=false
+      - name: Disable subnet routing
+        run: |
+          sudo tailscale set --accept-routes=false
+          sudo tailscale debug prefs | jq -e '.RouteAll == false and .CorpDNS == false' >/dev/null
+      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+        with:
+          version: v1.35.7
+      - uses: azure/use-kubelogin@76597ae0fcbaace21b05e13a2cbf8daee2c6e820 # v1.2
+        with:
+          kubelogin-version: v0.2.19
+      - uses: azure/aks-set-context@c7eb093e5a5d47caa333f64974d5fd1cd4bf069d # v4.0.3
+        with:
+          resource-group: ${{ vars.AZURE_RESOURCE_GROUP }}
+          cluster-name: ${{ vars.AZURE_AKS_CLUSTER_NAME }}
+          admin: false
+          use-kubelogin: true
+      - env:
+          GATEWAY_IMAGE: ${{ needs.publish.outputs.gateway }}
+          BACKUP_IMAGE: ${{ needs.publish.outputs.backup }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          TESLAMATE_SECRET_IDENTITY_CLIENT_ID: ${{ vars.TESLAMATE_SECRET_IDENTITY_CLIENT_ID }}
+          TESLAMATE_KEY_VAULT_NAME: ${{ vars.TESLAMATE_KEY_VAULT_NAME }}
+          TESLAMATE_BACKUP_ACCOUNT: ${{ vars.TESLAMATE_BACKUP_ACCOUNT }}
+          TESLAMATE_MODE: ${{ vars.TESLAMATE_MODE }}
+        run: ./deploy/deploy.sh
